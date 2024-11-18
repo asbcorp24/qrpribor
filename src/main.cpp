@@ -2,29 +2,31 @@
 #include <NimBLEDevice.h>      // Библиотека для работы с BLE
 #include <QRCode.h>            // Библиотека для генерации QR-кодов
 #include <mbedtls/aes.h>       // Библиотека для расшифровки AES
+#include <Preferences.h>       // Библиотека для работы с Preferences
 
 // Параметры e-ink экрана
-GxEPD2_BW<GxEPD2_213_B72, GxEPD2_213_B72::HEIGHT> display(GxEPD2_213_B72(SS, 17, 16, 4)); // Замена пинов под ваш экран
+GxEPD2_BW<GxEPD2_213_B72, GxEPD2_213_B72::HEIGHT> display(GxEPD2_213_B72(SS, 17, 16, 4)); // Настройте под ваш экран
+
+const char defaultDeviceId[] = "DEVICE_123";         // Статичный идентификатор устройства
+const char defaultEncryptionKey[] = "MySecureKey12"; // Статичный ключ шифрования (12 символов)
+String deviceId;
+char encryptionKey[16];
+
+Preferences preferences;  // Экземпляр для работы с Preferences
 
 const int relayPin = 5;        // Пин для управления реле
-String deviceId = "DEVICE_123"; // Уникальный идентификатор устройства
-String blePassword = "secureBLEPass"; // Пароль для BLE
+unsigned long relayEndTime = 0;
+bool relayActive = false;
 
 // Переменные для BLE
 NimBLEServer* pServer = nullptr;
-NimBLECharacteristic* pKeyCharacteristic = nullptr;
 NimBLECharacteristic* pTimeCharacteristic = nullptr;
 bool deviceConnected = false;
-
-// Параметры времени работы реле
-unsigned long relayEndTime = 0;
-bool relayActive = false;
-String encryptionKey; // Ключ шифрования, полученный по BLE
-void displayQRCode(const String& data);
-int decryptTime(const String& encryptedTime);
-void activateRelay(int duration);
 void displayTimeLeft(int secondsLeft);
-// Callback для обработки соединения BLE
+void activateRelay(int duration);
+int decryptTime(const String& encryptedTime);
+void displayQRCode(const String& data);
+// Инициализация BLE
 class MyServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* pServer) {
         deviceConnected = true;
@@ -37,17 +39,6 @@ class MyServerCallbacks : public NimBLEServerCallbacks {
     }
 };
 
-// Callback для обработки данных BLE
-class KeyCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
-    void onWrite(NimBLECharacteristic* pCharacteristic) {
-        std::string value = pCharacteristic->getValue();
-        if (value.length() > 0) {
-            encryptionKey = String(value.c_str());
-            Serial.println("Received encryption key: " + encryptionKey);
-        }
-    }
-};
-
 class TimeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* pCharacteristic) {
         std::string value = pCharacteristic->getValue();
@@ -57,53 +48,75 @@ class TimeCharacteristicCallbacks : public NimBLECharacteristicCallbacks {
         }
     }
 };
+
 void setup() {
     Serial.begin(115200);
+
+    // Инициализация Preferences
+    preferences.begin("device-config", false);
     
+    // Получение deviceId из памяти
+    if (preferences.isKey("deviceId")) {
+        deviceId = preferences.getString("deviceId", defaultDeviceId);
+    } else {
+        deviceId = defaultDeviceId;
+        preferences.putString("deviceId", deviceId);
+    }
+
+    // Получение encryptionKey из памяти
+    if (preferences.isKey("encryptionKey")) {
+        String storedKey = preferences.getString("encryptionKey", defaultEncryptionKey);
+        strncpy(encryptionKey, storedKey.c_str(), 16);
+    } else {
+        strncpy(encryptionKey, defaultEncryptionKey, 16);
+        preferences.putString("encryptionKey", encryptionKey);
+    }
+
+    Serial.println("Device ID: " + deviceId);
+    Serial.print("Encryption Key: ");
+    Serial.println(encryptionKey);
+
     // Инициализация e-ink экрана
     display.init(115200);
     display.setRotation(1);
     display.setTextColor(GxEPD_BLACK);
 
-    // Генерация QR-кода для идентификатора устройства
+    // Генерация QR-кода
     displayQRCode(deviceId);
 
-    // Инициализация BLE
+    // Настройка BLE
     NimBLEDevice::init("ESP32_Device");
     pServer = NimBLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
 
-    // Создание сервисов и характеристик BLE
     NimBLEService *pService = pServer->createService("12345678-1234-1234-1234-1234567890AB");
-    pKeyCharacteristic = pService->createCharacteristic(
-                         "abcd1234-1234-1234-1234-1234567890AB",
-                          NIMBLE_PROPERTY::WRITE);
     pTimeCharacteristic = pService->createCharacteristic(
-                         "dcba4321-1234-1234-1234-1234567890AB",
+                          "dcba4321-1234-1234-1234-1234567890AB",
                           NIMBLE_PROPERTY::WRITE);
+    pTimeCharacteristic->setCallbacks(new TimeCharacteristicCallbacks());
 
     pService->start();
     NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->addServiceUUID("12345678-1234-1234-1234-1234567890AB");
     pAdvertising->start();
 
-    // Установка пина реле
+    // Настройка пина реле
     pinMode(relayPin, OUTPUT);
     digitalWrite(relayPin, LOW);
 }
 
 void loop() {
     if (deviceConnected) {
-        // Проверка активации реле и времени окончания работы
+        // Проверка времени окончания работы реле
         if (relayActive && millis() >= relayEndTime) {
-            digitalWrite(relayPin, LOW); // Выключаем реле
+            digitalWrite(relayPin, LOW);
             relayActive = false;
-            displayQRCode(deviceId); // Обновляем QR-код после выключения реле
+            displayQRCode(deviceId);
         }
     }
 }
 
-// Функция для генерации QR-кода устройства
+// Генерация QR-кода
 void displayQRCode(const String& data) {
     display.firstPage();
     do {
@@ -111,12 +124,10 @@ void displayQRCode(const String& data) {
         display.setCursor(0, 10);
         display.println("Device ID:");
 
-        // Генерация QR-кода
         QRCode qrcode;
         uint8_t qrcodeData[qrcode_getBufferSize(3)];
         qrcode_initText(&qrcode, qrcodeData, 3, 0, data.c_str());
 
-        // Отображение QR-кода
         for (int y = 0; y < qrcode.size; y++) {
             for (int x = 0; x < qrcode.size; x++) {
                 if (qrcode_getModule(&qrcode, x, y)) {
@@ -127,54 +138,43 @@ void displayQRCode(const String& data) {
     } while (display.nextPage());
 }
 
-// Функция для активации реле на определенное время
+// Включение реле на определенное время
 void activateRelay(int duration) {
-    digitalWrite(relayPin, HIGH);          // Включаем реле
-    relayEndTime = millis() + duration * 1000; // Устанавливаем время окончания работы
+    digitalWrite(relayPin, HIGH);
+    relayEndTime = millis() + duration * 1000;
     relayActive = true;
-    
-    // Отображаем оставшееся время работы на e-ink экране
     displayTimeLeft(duration);
 }
 
-// Функция для отображения времени на e-ink экране
+// Отображение оставшегося времени на e-ink
 void displayTimeLeft(int secondsLeft) {
     display.firstPage();
     do {
         display.fillScreen(GxEPD_WHITE);
         display.setCursor(10, 20);
         display.println("Remaining time:");
-
         display.setCursor(10, 50);
         display.print(secondsLeft);
         display.println(" seconds");
     } while (display.nextPage());
 }
 
-// Функция для расшифровки времени работы
+// Расшифровка времени работы
 int decryptTime(const String& encryptedTime) {
-    // Инициализация AES
     mbedtls_aes_context aes;
     mbedtls_aes_init(&aes);
 
-    // Установка ключа шифрования
-    uint8_t key[16]; // Преобразование encryptionKey в массив байтов
-    for (int i = 0; i < 16; i++) {
-        key[i] = encryptionKey[i];
-    }
+    uint8_t key[16];
+    memcpy(key, encryptionKey, 16);
     mbedtls_aes_setkey_dec(&aes, key, 128);
 
-    // Декодирование времени работы
-    uint8_t input[16];
-    uint8_t output[16];
-    for (int i = 0; i < 16; i++) {
-        input[i] = encryptedTime[i];
-    }
+    uint8_t input[16] = {0};
+    uint8_t output[16] = {0};
+    memcpy(input, encryptedTime.c_str(), encryptedTime.length());
 
     mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, input, output);
     mbedtls_aes_free(&aes);
 
-    // Преобразуем результат обратно в int
     int decryptedTime = 0;
     for (int i = 0; i < 4; i++) {
         decryptedTime = (decryptedTime << 8) + output[i];
@@ -182,4 +182,3 @@ int decryptTime(const String& encryptedTime) {
 
     return decryptedTime;
 }
-
